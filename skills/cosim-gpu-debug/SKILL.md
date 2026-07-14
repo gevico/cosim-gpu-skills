@@ -1,160 +1,180 @@
 ---
 name: cosim-gpu-debug
-description: Debug QEMU+gem5 MI300X co-simulation failures. Use when guest boot, amdgpu probe, gem5 container startup, cosim socket, MMIO traffic, ROM loading, PSP/SMU masking, ROCm visibility, or GPU test execution fails in cosim-gpu.
+description: "Use as the main entry for cosim debugging: gem5 crashes, assertions, hangs, timeouts, address translation faults, non-PASS test results, guest-side waits, and QEMU exits that may be secondary to gem5. Collect logs, preserve live state when needed, route to gem5 model references, and decide the first failing component."
 ---
 
-# cosim-gpu Debug
+# Cosim Debug
 
-Use this skill when diagnosing a QEMU+gem5 MI300X co-simulation issue from the
-cosim-gpu repository. Keep the workflow evidence-oriented: identify which side
-failed, capture the smallest useful logs, then test the specific recovery.
+Use this skill as the debugging entry point for non-PASS cosim behavior. Keep
+the workflow evidence-first: identify the authoritative artifact, decide the
+first failing component, then read only the reference that matches the observed
+mechanism.
 
-## Baseline
+## Entry Guard
 
-- Work from the cosim-gpu repository root unless a command explicitly names a
-  submodule.
-- Treat QEMU, the guest serial console, the gem5 container, and shared memory as
-  separate failure domains.
-- Prefer targeted logs over broad dumps. Save material command output under
-  `build/agent/<task-slug>/` when the task is non-trivial.
-- Do not restart or delete a running cosim session until the current state has
-  been captured or the user explicitly asked for cleanup.
+For debug requests, use this workflow directly. Do not search for retired debug
+skills or older routing names. Translate historical dialogue into concrete
+evidence fields: artifact path, failing command, program identity, run id,
+environment row, first durable failure, live wait state, comparison row, and
+source mechanism under inspection.
 
-## Environment Check
+Environment variable questions are not debug evidence by themselves. Use
+`cosim-gpu-test` for runner prefix handling and `cosim-gpu-rocm-stack` for ROCm meaning.
+Return here when the environment row produces a non-PASS result or a live wait
+state.
 
-Check both simulator sides before changing state:
+## Evidence Authority
 
-```bash
-# gem5 container status
-docker ps -a --filter name=gem5-cosim --format '{{.Names}} {{.Status}}'
+Use `cosim-gpu-info-gathering` for broad artifact intake, prior conversation
+review, or any task that may otherwise require scanning many logs. This debug
+skill should reason from the compact evidence map before opening raw logs.
 
-# QEMU/screen sessions
-screen -ls 2>/dev/null
+Start by classifying the artifact state:
 
-# Shared resources
-ls -la /tmp/gem5-mi300x.sock /dev/shm/mi300x-vram /dev/shm/cosim-guest-ram 2>/dev/null
-```
+| Artifact state | Action |
+|---|---|
+| `verdict.json`, `matrix.tsv`, and `patch/binary-provenance.txt` exist | Treat archived files as authority. |
+| Runner row is incomplete and a matching process is alive | Take bounded live samples only when the active plan allows it. |
+| Runner row is incomplete and dead | Rerun only the accepted manifest row through `cosim-gpu-test`. |
+| Old row lacks gem5 log needed for ownership | Create a fixed rerun row with the same program, environment, timeout, and binary. |
+| QEMU-visible failure has no matching gem5 evidence | Classify as provisional until gem5 log is available. |
 
-Expected resources for the standard launch:
+Record the exact source and binary provenance before accepting any build or
+test evidence. Use `cosim-gpu-build` for build rules; do not duplicate its checks
+here.
 
-- gem5 container: `gem5-cosim`
-- cosim socket: `/tmp/gem5-mi300x.sock`
-- guest RAM: `/dev/shm/cosim-guest-ram`
-- VRAM: `/dev/shm/mi300x-vram`
+## Observable Event Routing
 
-## Two-Sided Log Collection
+For timeout, wait, and non-PASS rows, prefer a compact event summary before
+reading broad logs. Debug flags such as `GPUWgProgress`,
+`HSAPacketProcessor`, and `GPUCommandProc` are event sources, not the
+classification model. Different logs may fill the same observation dimension.
 
-### gem5 side
+Use `references/analysis/observable-dimensions.md` to map available logs into
+standard dimensions:
 
-```bash
-# Recent simulator logs
-docker logs gem5-cosim 2>&1 | tail -80
+- progress: dispatch count, completion count, active wave state
+- queue: read pointer, write pointer, dispatch pointer, packet completion
+- signal: completion signal address, signal write, interrupt or event wakeup
+- pressure: SQC retry, Ruby rejection, BufferFull, DMA or cache backpressure
+- failure: fatal, panic, assertion, translation fault, QEMU exit
 
-# Common high-signal messages
-docker logs gem5-cosim 2>&1 | grep -E "warn|error|fatal|panic|GART|cosim|SDMA|MI300X"
-```
+The preferred artifact tables are `coverage.tsv`, `progress.tsv`,
+`queue.tsv`, `signals.tsv`, and a short `diagnostic-summary.tsv`. Blank
+dimensions mean the evidence was not collected; `UNEXPLAINED` means the
+dimension was checked and no useful difference was found. Missing dimensions
+should guide the next minimal debug flag rather than trigger broad log reads.
 
-### QEMU / guest side
+## Common Evidence Workflow
 
-If the launch used the default `cosim_launch.sh` screen logging, read
-`/tmp/cosim-launch.log`:
+Collect these facts before proposing a source edit:
 
-```bash
-tail -80 /tmp/cosim-launch.log
-```
+- Program path, run id, interrupt mode, timeout value, and exact runner command.
+- Full gem5 log, QEMU log, guest log, verdict, matrix row, and binary
+  provenance.
+- First durable failure line and the last 50-100 relevant lines before it.
+- Nearest passing comparison or a note explaining why none exists.
+- First object that differs: packet id, queue id, doorbell offset, signal
+  address, PASID, VMID, GPU virtual address, physical address, PTE value,
+  callback id, or interrupt cookie.
 
-If the session was started as `qemu-cosim`, snapshot the screen without typing
-into the guest:
-
-```bash
-screen -S qemu-cosim -p 0 -X hardcopy /tmp/qemu-snap.txt
-grep -v '^$' /tmp/qemu-snap.txt | tail -40
-```
-
-## Guest-Side Inspection
-
-Send commands through the active screen session only after confirming its name.
-For `qemu-cosim`:
-
-```bash
-screen -S qemu-cosim -p 0 -X stuff 'dmesg | grep -i amdgpu | tail -40\n'
-screen -S qemu-cosim -p 0 -X stuff 'lspci; lspci -vvs 00:03.0\n'
-screen -S qemu-cosim -p 0 -X stuff 'lsmod | grep amdgpu; rocm-smi; rocminfo 2>/dev/null | head -80\n'
-screen -S qemu-cosim -p 0 -X stuff 'systemctl status cosim-gpu-setup.service --no-pager\n'
-```
-
-For the default `cosim-launch` session, replace `qemu-cosim -p 0` with
-`cosim-launch`.
-
-## Common Failure Patterns
-
-### NULL deref in `amdgpu_atom_parse_data_header`
-
-Symptom: kernel oops at `amdgpu_atom_parse_data_header+0x1b`, often with
-`RAX=0`.
-
-Cause: the ROM was not copied to guest physical `0xC0000` before `modprobe`. In
-cosim mode the driver's BIOS discovery chain fails unless the ROM is available
-through guest RAM for gem5's SMU ROM path.
-
-Recovery:
+Use focused searches first:
 
 ```bash
-dd if=/root/roms/mi300.rom of=/dev/mem bs=1k seek=768 count=128
-modprobe amdgpu ip_block_mask=0x67 ppfeaturemask=0 dpm=0 audio=0 ras_enable=0 discovery=2
+rg -n 'fatal|panic|assert|PM4|SDMA|VMID|PASID|doorbell|interrupt|signal|GART|PTE|translation|fault|timeout|Broken pipe|error_setv' \
+  <artifact>/logs/gem5.log <artifact>/logs/qemu.log <artifact>/logs/guest
 ```
 
-### PSP firmware load failure
+## Component Decision
 
-Symptom: `PSP load tmr failed!` followed by panic or reset failure.
+Choose the next action from the first durable evidence:
 
-Cause: PSP init was still enabled. `0x6f` disables SMU but not PSP for this
-setup.
+| Evidence | Action |
+|---|---|
+| gem5 log ends with `fatal`, `panic`, assertion, or container exit | Inspect gem5 logs and load `references/gem5-model/overview.md`. |
+| QEMU shows `error_setv`, vfio-user abort, socket close, or `Aborted` while gem5 may have exited | Treat QEMU as secondary until `references/qemu/error-setv-pattern.md` and gem5 logs say otherwise. |
+| gem5 log shows `User translation fault`, `GART`, unmapped page, VMID/PASID, PTE, or doorbell evidence | Load `references/gem5-model/address-translation-fault.md`. |
+| Workload is alive but output and progress counters stop changing | Keep the guest alive and load `references/analysis/live-wait-state.md`. |
+| Workload times out while dispatch and completion keep changing | Classify as throughput, scale, or timeout-budget evidence before editing model code. |
+| Non-PASS result has no crash | Use `references/analysis/debug-analysis.md` and `references/analysis/observable-dimensions.md`. |
+| cache, signal, PM4, VMID, PASID, SDMA, TLB, or PWC appears in logs | Load the matching gem5 model reference. |
 
-Recovery: use `ip_block_mask=0x67`, which disables both PSP and SMU.
-
-### gem5 container exits immediately
-
-Check `docker logs gem5-cosim 2>&1 | tail -80`. Usual causes are Python config
-syntax errors, missing shared-memory files, missing socket permissions, or host
-OOM during startup.
-
-### QEMU loses connection to gem5
-
-gem5 crashed or closed `/tmp/gem5-mi300x.sock`. Inspect gem5 logs for `fatal`,
-`panic`, assertion failures, and the last MMIO or SDMA message before shutdown.
-
-### Driver loads but ROCm reports uninitialized GPU
-
-Check guest `dmesg`, `rocm-smi`, and `systemctl status cosim-gpu-setup`. KIQ
-disable timeout `-110` is expected in this cosim path; missing `amdgpu` in
-`lsmod` is not.
-
-### Setup service exits successfully but module is absent
-
-Symptom: `cosim-gpu-setup.service` reports success, but `lsmod | grep amdgpu`
-is empty.
-
-Cause: a runtime modprobe blacklist from the kernel command line caused
-`modprobe` to return success without loading the driver.
-
-Recovery inside the guest setup path:
+For the known MAP_QUEUES VMID assertion, inspect:
 
 ```bash
-rm -f /run/modprobe.d/*blacklist* 2>/dev/null
-modprobe amdgpu ip_block_mask=0x67 ppfeaturemask=0 dpm=0 audio=0 ras_enable=0 discovery=2
+grep -n 'assert.*vmid\|assert(queue_vmid)\|MAPQueues' \
+  gem5/src/dev/amdgpu/pm4_packet_processor.cc
 ```
 
-## Debug Flags
+Then read:
 
-Useful launch-time flags:
+- `references/gem5-model/vmid-assert-lesson.md`
+- `references/gem5-model/examples/vmid-assert-crash.md`
+- `references/gem5-model/vmid-pasid-architecture.md`
 
-```bash
-./scripts/cosim_launch.sh --gem5-debug MI300XCosim
-./scripts/cosim_launch.sh --gem5-debug AMDGPUDevice,PM4PacketProcessor
-./scripts/cosim_launch.sh --gem5-debug SDMAEngine
-./scripts/cosim_launch.sh --qemu-trace 'mi300x_gem5_*'
-```
+## Timeout and Wait Workflow
 
-Record the exact launch command, relevant log paths, and the observed pass or
-failure marker before declaring the issue fixed.
+Read `references/analysis/debug-workflows.md` for timeout, wait-state, and
+throughput workflows after the artifact summary identifies the missing
+dimension or live state.
+
+## Performance Optimization Workflow
+
+Read `references/analysis/debug-workflows.md` when the active objective is
+simulator efficiency rather than functional correctness.
+
+## Address Translation Fault Review
+
+Use this when gem5 shows `User translation fault`, `GART cosim`, unmapped page,
+PTE diagnostics, VMID/PASID mismatch, or unknown doorbell evidence near a
+crash. Read `references/gem5-model/address-translation-fault.md`.
+
+Minimum notes before editing:
+
+- failing program, run id, HSA interrupt value, and nearest passing row
+- first gem5 fatal line and any secondary QEMU socket or `error_setv` symptom
+- faulting GPU virtual address, physical address if any, PTE value, GART base,
+  page-table base, VMID, PASID, queue id, and doorbell offset
+- PM4, SDMA, or HSA packet sequence immediately before the failing translation
+- whether the fault is deterministic across interrupt modes
+
+QEMU `error_setv`, EOF, broken pipe, and device-lost messages are secondary
+when gem5 logs contain an earlier translation fatal for the same run id.
+
+## Script Discipline
+
+Read `references/analysis/debug-workflows.md` before adding debug scripts or
+source instrumentation.
+
+## Guest Inspection
+
+Use `cosim-gpu-guest` for console transport and guest command injection. Gather:
+
+- PCI device state for the emulated GPU
+- loaded amdgpu module state
+- `cosim-gpu-setup.service` status
+- ROCm device visibility and agent enumeration
+- full and filtered kernel logs
+- target process id, thread table, wait channel, kernel stacks, file
+  descriptors, and user-space backtrace when the target remains live
+
+## Patch Readiness
+
+Read `references/analysis/debug-workflows.md` before deciding that a source edit
+is ready.
+
+## References
+
+- `references/analysis/debug-analysis.md` - fact recording and comparison guide
+- `references/analysis/observable-dimensions.md` - observable dimensions checklist
+- `references/analysis/live-wait-state.md` - live guest wait-state sampling
+- `references/analysis/debug-workflows.md` - timeout, performance, script, and patch-readiness workflows
+- `references/gem5-model/overview.md` - gem5 MI300X model map
+- `references/gem5-model/discovery-log.md` - prior model discoveries
+- `references/gem5-model/cache-coherence-checkpoints.md` - TLB, PWC, SQC, GL2 checkpoints
+- `references/gem5-model/address-translation-fault.md` - GART, PTE, VMID/PASID, and doorbell fault review
+- `references/gem5-model/hsa-signal-completion-pattern.md` - HSA signal completion design
+- `references/gem5-model/vmid-pasid-architecture.md` - VMID/PASID semantics
+- `references/gem5-model/vmid-assert-lesson.md` - MAP_QUEUES VMID assertion lesson
+- `references/qemu/qemu-first-failure.md` - QEMU-first failure reference
+- `references/qemu/error-setv-pattern.md` - QEMU error propagation pattern

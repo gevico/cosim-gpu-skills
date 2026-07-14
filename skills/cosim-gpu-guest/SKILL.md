@@ -1,128 +1,122 @@
 ---
 name: cosim-gpu-guest
-description: Interact with the cosim-gpu guest Linux over the QEMU screen serial console. Use when sending commands to the guest, mounting the 9p share, checking GPU state, building tests in the guest, running tests, or shutting the guest down cleanly.
+description: Use when you need to send commands to a running cosim guest. Console pipe interaction, 9p share mount, GPU status check, manual driver load.
 ---
 
-# cosim-gpu Guest Interaction
+# Cosim Guest
 
-Use this skill for controlled interaction with a running cosim-gpu guest. The
-normal launch path uses `scripts/cosim_launch.sh`, a `cosim-launch` screen
-session, and `/tmp/cosim-launch.log`.
+Interact with the cosim guest Linux through the detached runner session created
+by `scripts/run_cosim_tests.sh --hang-env`.
 
 ## Prerequisites
 
-Confirm the environment before typing into the guest:
+The runner prints the active console log and control pipe when it leaves a hang
+debug environment alive:
+
+```text
+Console log: /path/to/qemu.log
+Console pipe: /tmp/<session-name>-<run-id>.session/console.in
+```
+
+If those lines are unavailable, derive the paths from the run id and session
+name used for the `--hang-env` command:
 
 ```bash
-screen -ls 2>/dev/null
+SESSION_NAME=qemu-cosim-tests
+RUN_ID=<run-id>
+CONSOLE_PIPE="/tmp/${SESSION_NAME}-${RUN_ID}.session/console.in"
+CONSOLE_LOG="/tmp/${SESSION_NAME}-${RUN_ID}.log"
 docker ps --filter name=gem5-cosim --format '{{.Names}}: {{.Status}}'
-tail -20 /tmp/cosim-launch.log
+test -p "$CONSOLE_PIPE"
+test -f "$CONSOLE_LOG"
 ```
 
-Do not assume the session name. Use `cosim-launch` only after it appears in
-`screen -ls`.
-
-## Sending Guest Commands
+## Sending Commands
 
 ```bash
-# Send a command
-screen -S cosim-launch -X stuff '<command>\n'
-
-# Send Ctrl-C
-screen -S cosim-launch -X stuff $'\x03'
-
-# Read recent output
-tail -80 /tmp/cosim-launch.log
+printf '%s\n' '<command>' > "$CONSOLE_PIPE"
+printf '\003' > "$CONSOLE_PIPE"   # Ctrl-C
+tail -n 80 "$CONSOLE_LOG"
 ```
 
-For commands that take time, capture the log line count before sending the
-command and then wait for new output:
-
+Wait pattern:
 ```bash
-baseline=$(wc -l < /tmp/cosim-launch.log)
-screen -S cosim-launch -X stuff '<command>\n'
+baseline=$(wc -l < "$CONSOLE_LOG")
+printf '%s\n' '<command>' > "$CONSOLE_PIPE"
 while true; do
-    current=$(wc -l < /tmp/cosim-launch.log)
-    if [ "$current" -gt "$((baseline + 3))" ]; then
-        tail -80 /tmp/cosim-launch.log
+    current=$(wc -l < "$CONSOLE_LOG")
+    if [[ "$current" -gt "$((baseline + 3))" ]]; then
+        tail -20 "$CONSOLE_LOG"
         break
     fi
-    sleep 5
+    sleep 2
 done
 ```
 
-## Mounting the 9p Share
+## Common operations
 
-The host launch option `--share-dir <path>` exposes a virtio-9p mount named
-`cosim_share`. Mount it in the guest with:
-
-```bash
-screen -S cosim-launch -X stuff 'mkdir -p /mnt && mount -t 9p -o trans=virtio,version=9p2000.L cosim_share /mnt\n'
-```
-
-Files from the host share then appear under guest `/mnt`.
-
-## Building and Running GPU Tests
+### Mount 9p share
 
 ```bash
-# Copy shared test sources and build
-screen -S cosim-launch -X stuff 'mkdir -p /root/tests && cp -r /mnt/* /root/tests/ && make -C /root/tests all 2>&1 | tail -20\n'
-
-# Run all tests
-screen -S cosim-launch -X stuff 'make -C /root/tests test 2>&1\n'
-
-# Run one test binary
-screen -S cosim-launch -X stuff '/root/tests/build/<test_name> 2>&1\n'
+printf '%s\n' 'mount -t 9p -o trans=virtio,version=9p2000.L cosim_share /mnt' > "$CONSOLE_PIPE"
 ```
 
-Treat test completion as unproven until the serial log shows the test-specific
-pass marker or failure output.
+After mounting, paths under `/mnt` must resolve inside the shared tree. Host
+symlinks that point outside the shared repository will appear in the guest but
+may resolve to an unmounted guest path. If a script or artifact is missing
+through such a symlink, classify it as a guest bridge path issue and rerun with
+a guest-visible path before using the result as model evidence.
 
-## GPU Status Checks
+Do not assume any particular host storage layout for artifacts. One developer
+may keep artifacts as a real directory, another may point it at a larger disk,
+and a CI worker may use a temporary workspace. Runner scripts that execute in
+the guest should therefore use a configurable guest-visible bridge path inside
+the shared tree, while final logs, matrices, verdicts, and provenance are still
+archived under the requested artifact directory. The transient bridge directory
+is not evidence by itself; preserve its script and output under the row artifact
+before cleanup.
+
+### Build and run tests
 
 ```bash
-screen -S cosim-launch -X stuff 'rocm-smi\n'
-screen -S cosim-launch -X stuff 'rocminfo 2>/dev/null | head -80\n'
-screen -S cosim-launch -X stuff 'dmesg | grep -i amdgpu | tail -40\n'
-screen -S cosim-launch -X stuff 'systemctl is-active cosim-gpu-setup; systemctl status cosim-gpu-setup --no-pager\n'
+# Build tests from 9p share
+printf '%s\n' 'cd /mnt/tests && make -j1' > "$CONSOLE_PIPE"
+
+# Run a ROCm device program with the same privilege level as the test runner.
+printf '%s\n' "printf '%s\n' \"\${COSIM_GUEST_SUDO_PASSWORD:?set COSIM_GUEST_SUDO_PASSWORD}\" | sudo -S bash -lc 'cd /mnt/tests && ./build/vector_add'" > "$CONSOLE_PIPE"
 ```
 
-`amdgpu` must be present in `lsmod`; a successful service exit alone is not
-enough because a runtime blacklist can make `modprobe` exit zero without loading
-the module.
+Use this privilege pattern for programs that open `/dev/kfd` or
+`/dev/dri/renderD*`. A plain `gem5` user launch is an invalid device-debug
+setup because it can enumerate no GPU device.
 
-## Launching a Session
+### Check GPU status
 
 ```bash
-# Basic launch with screen log
-screen -dmS cosim-launch -L -Logfile /tmp/cosim-launch.log \
-    ./scripts/cosim_launch.sh
-
-# Launch with host share and gem5 debug flags
-screen -dmS cosim-launch -L -Logfile /tmp/cosim-launch.log \
-    ./scripts/cosim_launch.sh --share-dir /path/to/dir --gem5-debug MI300XCosim
+printf '%s\n' 'rocm-smi' > "$CONSOLE_PIPE"
+printf '%s\n' 'rocminfo 2>/dev/null | head -40' > "$CONSOLE_PIPE"
+printf '%s\n' 'dmesg | grep -i amdgpu | tail -10' > "$CONSOLE_PIPE"
 ```
 
-Wait for a concrete boot marker before guest operations, for example an automatic
-login prompt in `/tmp/cosim-launch.log`.
-
-## Clean Shutdown
-
-Prefer an in-guest shutdown when the guest is responsive:
+### Manual driver load
 
 ```bash
-screen -S cosim-launch -X stuff 'poweroff\n'
+printf '%s\n' 'dd if=/root/roms/mi300.rom of=/dev/mem bs=1k seek=768 count=128 && rm -f /run/modprobe.d/*blacklist* && modprobe amdgpu ip_block_mask=0x67 ppfeaturemask=0 dpm=0 audio=0 ras_enable=0 discovery=2' > "$CONSOLE_PIPE"
 ```
 
-If QEMU must be terminated from the console, send the QEMU monitor exit chord:
+### Shutdown
 
 ```bash
-screen -S cosim-launch -X stuff $'\x01x'
+printf '%s\n' "printf '%s\n' \"\${COSIM_GUEST_SUDO_PASSWORD:?set COSIM_GUEST_SUDO_PASSWORD}\" | sudo -S poweroff" > "$CONSOLE_PIPE"
 ```
 
-Clean residual host resources only after QEMU and gem5 are stopped:
+Use privileged shutdown after hang-debug evidence is saved. This matches the
+privilege level used for ROCm device programs and avoids leaving a live guest
+waiting for manual poweroff. If the guest no longer accepts console input,
+record that fact and use the host cleanup script.
 
-```bash
-docker rm -f gem5-cosim 2>/dev/null
-rm -f /tmp/gem5-mi300x.sock /dev/shm/mi300x-vram /dev/shm/cosim-guest-ram 2>/dev/null
-```
+## Integration
+
+- Use `cosim-gpu-test` for automated test execution
+- Use `cosim-gpu-debug` for two-sided inspection
+- For manual debugging sessions, send commands directly as shown above
