@@ -163,6 +163,17 @@ Use `cosim-gpu-guest` for console transport and guest command injection. Gather:
 Read `references/analysis/debug-workflows.md` before deciding that a source edit
 is ready.
 
+## QEMU Trace
+
+Trace the standard vfio-user transport when QEMU-side protocol evidence is
+needed:
+
+```bash
+./scripts/cosim_launch.sh --qemu-trace 'vfio_user_*'
+```
+
+Record the exact launch command and trace log with the run artifacts.
+
 ## References
 
 - `references/analysis/debug-analysis.md` - fact recording and comparison guide
